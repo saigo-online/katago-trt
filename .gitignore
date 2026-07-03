@@ -95,3 +95,22 @@ cpp/external/katagocoreml/proto/
 # saigo katago-trt: build outputs and benchmark artifacts
 /build/
 bench/results/
+
+# CGOS bot runtime (may contain protocol logs)
+cgos/logs/
+cgos/cgos-run.log
+cgos/sgf/
+cgos/kill.txt
+# CGOS/shootout generated data + one-off test scaffolding (keep only the reusable tooling)
+cgos/*.log
+cgos/*.out
+cgos/*.jsonl
+cgos/*.result
+cgos/shootout/
+cgos/an-fp8.cfg
+cgos/v17*.cfg
+cgos/v17*.sh
+cgos/v17*.out
+cgos/v17*.log
+cgos/v17*.result
+cgos/run_v17val.sh
