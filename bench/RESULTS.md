@@ -126,19 +126,23 @@ The working recipe, in order of the walls cleared:
    its block's *decoded* FP8 scale), feed both as constants straight into `IDequantize` (no
    `IQuantize` — an FP8 scale can't feed one). Constants fold at build time and run cleanly.
 
-That runs end-to-end, no crash. But two hard limits remain on this net:
+That runs end-to-end (any kernel size — 1×1 *and* 3×3), no crash. But two hard limits remain, and
+both are now **measured**, not guessed:
 
-- **Slower, not faster.** The clean reshape only reaches **1×1 convs**, where FP4's reshape+quant
-  overhead dominates — 926 nnEvals/s vs FP16's 991. The 3×3 FLOP bulk (where FP4 would pay off)
-  needs an NHWC trunk. So no speed win here.
-- **FP4 PTQ is too lossy.** Post-training 4-bit costs **scoreLead ~0.47 from the 1×1 convs alone**
-  (vs FP8's 0.077) — E2M1 is only 3 bits of precision. Verified not an encoding bug (flipping the
-  nibble order gives score ~163). A playable FP4 net would need **quantization-aware training**.
+- **Slower, not faster — no NCHW shortcut exists.** The reshapes/transposes that satisfy the
+  block-layout rule stop TensorRT from fusing a *native* FP4 conv: it dequantizes to FP16, runs FP16,
+  and *also* pays the reshape overhead. Quantizing the whole trunk (3×3 + 1×1) gives **836 nnEvals/s
+  at t=64 — slower than FP16 (~991), FP8 (~1360), and even CUDA (~961).** Native FP4 tensor-core
+  convs need a channels-last (NHWC) trunk so no reshape breaks the fusion.
+- **FP4 PTQ is far too lossy.** Post-training 4-bit on the trunk costs **scoreLead ~0.54, policy
+  ~0.18** vs FP32 — unplayable (E2M1 is 3 bits of precision). Verified not an encoding bug (flipping
+  the nibble order gives score ~163). A usable FP4 net needs **quantization-aware training**.
 
-So FP4 is a solved *execution* problem but not a practical inference win for this net.
-`trtTrunkPrecision=fp4` rejects with this explanation; `trtTrunkPrecisionExperimentalFp4=true` runs
-it. A useful FP4 would need an NHWC trunk (for the 3×3 speed) **and** QAT (for accuracy) — the
-former is the same NHWC groundwork KataGo's ONNX path already has; the latter is a training effort.
+So FP4 is a solved *execution* problem (`buildFP4Conv` handles any kernel), but making it a practical
+win needs **both** an NHWC trunk (for the speed — the same NHWC groundwork KataGo's ONNX path already
+has) **and** QAT (for the accuracy — a training-pipeline effort, not a backend one). Neither is a
+bounded backend change. `trtTrunkPrecision=fp4` rejects with this summary;
+`trtTrunkPrecisionExperimentalFp4=true` runs it.
 
 ## Precision ladder, measured
 
@@ -147,7 +151,7 @@ former is the same NHWC groundwork KataGo's ONNX path already has; the latter is
 | FP32/TF32 | 0.5× | correct, slow (no FP16 on RTX weakly-typed) |
 | FP16 (mixed) | 1.0× | ✅ shipped, ≈/> CUDA at batch ≥ 32 |
 | FP8 (per-tensor) | ~1.4× | ✅ +35–45% nnEvals, analytic per-conv activation scale (near-FP16 accuracy) |
-| FP4 (NVFP4) | <1× here | ⚠️ executes correctly (crash fixed), but 1×1-only (slower) + PTQ too lossy → needs NHWC + QAT |
+| FP4 (NVFP4) | 0.6× here | ⚠️ executes any-kernel (crash fixed), but reshapes block FP4 fusion → *slower* than FP16, and PTQ unplayable → needs NHWC + QAT |
 
 ## Caveats / future work
 

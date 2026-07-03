@@ -988,82 +988,86 @@ struct ModelParser {
     return convLayer;
   }
 
-  // Experimental NVFP4 conv (block-16 microscaling) on the Blackwell FP4 tensor cores. The blocker
-  // for FP4 was that block quantization requires the blocked (channel/contraction) dim to be last or
-  // 2nd-to-last, which NCHW [N,C,H,W] is not. Reshaping the activation to [N, C, H*W] puts C at the
-  // 2nd-to-last position, so the block-16 dynamic quantize's layout check passes without transposing
-  // the whole trunk. Weights are baked as pre-quantized FP4+FP8-scale constants (see below). Returns
-  // nullptr (fall back to FP16) if TensorRT can't build/fuse it. Only reachable for 1x1 convs, where
-  // the weight contraction is a clean [outC, inC] and can also be block-quantized along inC.
-  ILayer* buildFP4Conv1x1(ITensor* input, const ConvLayerDesc* desc) {
+  // Experimental NVFP4 conv (block-16 microscaling) on the Blackwell FP4 tensor cores, for any kernel
+  // size. The blocker was that block quantization requires the blocked (channel/contraction) dim to be
+  // last or 2nd-to-last, which NCHW is not. Two reshapes/transposes fix that without an NHWC trunk:
+  //   * activation [N,C,H,W] -> [N,C,H*W] puts C 2nd-to-last, so block-16 dynamic quantize is legal;
+  //   * weights [outC,inC,kh,kw] are BAKED in [outC,kh,kw,inC] order (inC last) as pre-quantized FP4
+  //     (E2M1) + FP8 (E4M3) block-scale constants -> IDequantize -> transposed back to [outC,inC,kh,kw]
+  //     for the conv. Baking (not dynamic-quantizing) the weights is essential: dynamic weight quant
+  //     stays a runtime op and segfaults inside libnvinfer; constants fold at build time. No IQuantize
+  //     (an FP8 scale can't feed one). Each element is quantized against its block's *decoded* FP8 scale
+  //     so the dequant reconstructs it without scale double-rounding.
+  // Returns nullptr (fall back to FP16) if the conv can't be block-quantized (inC not a multiple of 16).
+  ILayer* buildFP4Conv(ITensor* input, const ConvLayerDesc* desc) {
     auto& net = model->network;
     const int inC = desc->inChannels, outC = desc->outChannels;
-    if(desc->convXSize != 1 || desc->convYSize != 1) return nullptr;  // 3x3 weight block layout is not clean; NHWC needed
+    const int kh = desc->convYSize, kw = desc->convXSize;
     if((inC % 16) != 0) return nullptr;
 
-    // Activation [N,C,H,W] -> [N,C,H*W] (3D): now C is the 2nd-to-last dim, so block-16 over it passes
-    // the layout check. (A 1x1 *kernel* conv still has full HxW spatial — only the kernel is 1x1.)
+    // --- Activation: reshape so C is 2nd-to-last, dynamic block-quantize to FP4, dequantize, reshape back.
     auto aShuf = net->addShuffle(*input);
-    aShuf->setReshapeDimensions(Dims{3, {0, 0, -1}});  // keep N,C; flatten H,W
+    aShuf->setReshapeDimensions(Dims{3, {0, 0, -1}});  // [N,C,H,W] -> [N,C,H*W]
     aShuf->setName((desc->name + "/a3d").c_str());
-    // NVFP4 microscaling: block 16 elements along the channel axis (dim 1, 2nd-to-last). The V1
-    // addDynamicQuantize takes a scalar blockSize + axis, which is what the double-quant-scaled FP8
-    // scale path requires (the V2 Dims-blockShape form is rejected when a double_quant_scale is set).
     auto aQ = net->addDynamicQuantize(*aShuf->getOutput(0), 1, 16, DataType::kFP4, DataType::kFP8);
     if(!aQ) return nullptr;
-    // The per-block FP8 scales are themselves scaled by a positive 0D scalar (input 1).
     auto dqScalarBuf = make_unique<float[]>(1); dqScalarBuf[0] = 1.0f;
     auto dqScalar = net->addConstant(Dims{0, {}}, nvinfer1::Weights{DataType::kFLOAT, dqScalarBuf.get(), 1});
     model->extraWeights.push_back(move(dqScalarBuf));
-    aQ->setInput(1, *dqScalar->getOutput(0));
+    aQ->setInput(1, *dqScalar->getOutput(0));  // per-block FP8 scales' double-quant scalar
     aQ->setName((desc->name + "/aq4").c_str());
     auto aDQ = net->addDequantize(*aQ->getOutput(0), *aQ->getOutput(1), DataType::kHALF);
     aDQ->setAxis(1);
     aDQ->setName((desc->name + "/adq4").c_str());
     auto aBack = net->addShuffle(*aDQ->getOutput(0));
-    aBack->setReshapeDimensions(Dims4(0, 0, model->nnYLen, model->nnXLen));
+    aBack->setReshapeDimensions(Dims4(0, 0, model->nnYLen, model->nnXLen));  // -> [N,C,H,W]
     aBack->setName((desc->name + "/a4d").c_str());
 
-    // Weights [outC, inC], block-16 over inC. FULLY PRE-QUANTIZED (baked) NVFP4: we compute the FP4
-    // (E2M1) weight values and their FP8 (E4M3) per-block scales offline and feed both as constants
-    // straight into IDequantize -> conv. No IQuantize (an FP8 scale tensor can't be an IQuantize input)
-    // and no dynamic quantize on weights (that stays a runtime op and segfaults inside libnvinfer). The
-    // constant FP4 weights + IDequantize is the pattern TensorRT recognizes to run the conv on the
-    // Blackwell FP4 tensor cores. Each element is quantized against its block's *decoded* FP8 scale so
-    // the dequant reconstructs it exactly (no scale double-rounding).
+    // --- Weights: bake FP4 + FP8 block scales in [outC, kh, kw, inC] order (inC last, blocked by 16).
     const int nBlk = inC / 16;
-    auto wfp4 = make_unique<uint8_t[]>(((size_t)outC * inC + 1) / 2);  // 2 FP4 nibbles per byte
-    auto wscale8 = make_unique<uint8_t[]>((size_t)outC * nBlk);
+    const int64_t nW = (int64_t)outC * kh * kw * inC;
+    auto wfp4 = make_unique<uint8_t[]>((size_t)(nW + 1) / 2);
+    auto wscale8 = make_unique<uint8_t[]>((size_t)outC * kh * kw * nBlk);
+    auto srcW = [&](int o, int ic, int ky, int kx) -> float {  // desc->weights is [outC, inC, kh, kw]
+      return desc->weights[(((size_t)o * inC + ic) * kh + ky) * kw + kx];
+    };
     for(int o = 0; o < outC; o++)
-      for(int b = 0; b < nBlk; b++) {
-        float m = 1e-12f;
-        for(int i = 0; i < 16; i++) { float v = fabsf(desc->weights[(size_t)o * inC + b * 16 + i]); if(v > m) m = v; }
-        __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(m / 6.0f, __NV_SATFINITE, __NV_E4M3);
-        wscale8[(size_t)o * nBlk + b] = static_cast<uint8_t>(s8);
-        __half_raw hr = __nv_cvt_fp8_to_halfraw(s8, __NV_E4M3);
-        float dScale = __half2float(*reinterpret_cast<__half*>(&hr));
-        if(dScale <= 0.0f) dScale = 1e-12f;
-        for(int i = 0; i < 16; i++) {
-          size_t j = (size_t)o * inC + b * 16 + i;
-          __nv_fp4_storage_t q = __nv_cvt_float_to_fp4(desc->weights[j] / dScale, __NV_E2M1, cudaRoundNearest);
-          uint8_t nib = static_cast<uint8_t>(q) & 0x0F;
-          if(j & 1) wfp4[j >> 1] |= (nib << 4); else wfp4[j >> 1] = nib;  // low nibble = even index (verified)
-        }
-      }
-    auto wConst = net->addConstant(Dims{2, {outC, inC}}, nvinfer1::Weights{DataType::kFP4, wfp4.get(), (int64_t)outC * inC});
-    auto wScaleConst = net->addConstant(Dims{2, {outC, nBlk}}, nvinfer1::Weights{DataType::kFP8, wscale8.get(), (int64_t)outC * nBlk});
+      for(int ky = 0; ky < kh; ky++)
+        for(int kx = 0; kx < kw; kx++)
+          for(int b = 0; b < nBlk; b++) {
+            float m = 1e-12f;
+            for(int i = 0; i < 16; i++) { float v = fabsf(srcW(o, b * 16 + i, ky, kx)); if(v > m) m = v; }
+            __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(m / 6.0f, __NV_SATFINITE, __NV_E4M3);
+            size_t scaleIdx = (((size_t)o * kh + ky) * kw + kx) * nBlk + b;
+            wscale8[scaleIdx] = static_cast<uint8_t>(s8);
+            __half_raw hr = __nv_cvt_fp8_to_halfraw(s8, __NV_E4M3);
+            float dScale = __half2float(*reinterpret_cast<__half*>(&hr));
+            if(dScale <= 0.0f) dScale = 1e-12f;
+            for(int i = 0; i < 16; i++) {
+              int ic = b * 16 + i;
+              size_t j = (((size_t)o * kh + ky) * kw + kx) * inC + ic;  // [outC,kh,kw,inC] flat index
+              __nv_fp4_storage_t q = __nv_cvt_float_to_fp4(srcW(o, ic, ky, kx) / dScale, __NV_E2M1, cudaRoundNearest);
+              uint8_t nib = static_cast<uint8_t>(q) & 0x0F;
+              if(j & 1) wfp4[j >> 1] |= (nib << 4); else wfp4[j >> 1] = nib;  // low nibble = even index
+            }
+          }
+    auto wConst = net->addConstant(Dims4(outC, kh, kw, inC), nvinfer1::Weights{DataType::kFP4, wfp4.get(), nW});
+    auto wScaleConst = net->addConstant(Dims4(outC, kh, kw, nBlk), nvinfer1::Weights{DataType::kFP8, wscale8.get(), (int64_t)outC * kh * kw * nBlk});
     model->extraFp8Weights.push_back(move(wfp4));
     model->extraFp8Weights.push_back(move(wscale8));
-    Dims wBlk; wBlk.nbDims = 2; wBlk.d[0] = 1; wBlk.d[1] = 16;
+    Dims wBlk; wBlk.nbDims = 4; wBlk.d[0] = 1; wBlk.d[1] = 1; wBlk.d[2] = 1; wBlk.d[3] = 16;  // block over last dim (inC)
     auto wDQ = net->addDequantize(*wConst->getOutput(0), *wScaleConst->getOutput(0), DataType::kHALF);
     wDQ->setBlockShape(wBlk); wDQ->setName((desc->name + "/wdq4").c_str());
+    // Transpose [outC, kh, kw, inC] -> [outC, inC, kh, kw] for the conv kernel (folds at build).
     auto wBack = net->addShuffle(*wDQ->getOutput(0));
-    wBack->setReshapeDimensions(Dims4(outC, inC, 1, 1));  // -> conv kernel [outC, inC, 1, 1]
+    wBack->setFirstTranspose(Permutation{{0, 3, 1, 2}});
+    wBack->setName((desc->name + "/wperm").c_str());
 
     auto conv = net->addConvolutionNd(
-      *aBack->getOutput(0), outC, {2, {1, 1}},
+      *aBack->getOutput(0), outC, {2, {kh, kw}},
       nvinfer1::Weights{DataType::kHALF, nullptr, 0}, nvinfer1::Weights{DataType::kHALF, nullptr, 0});
     conv->setInput(1, *wBack->getOutput(0));
+    conv->setDilationNd({2, {desc->dilationY, desc->dilationX}});
     conv->setPaddingMode(PaddingMode::kSAME_UPPER);
     conv->setName(desc->name.c_str());
     return conv;
@@ -1074,7 +1078,7 @@ struct ModelParser {
     const int inC = desc->inChannels, outC = desc->outChannels;
     const int kh = desc->convYSize, kw = desc->convXSize;
     if(quantBits == 4) {
-      ILayer* fp4 = buildFP4Conv1x1(input, desc);
+      ILayer* fp4 = buildFP4Conv(input, desc);
       return fp4;  // may be nullptr for 3x3 -> buildConvLayer falls back to FP16
     }
     const int64_t nW = static_cast<int64_t>(desc->weights.size());
@@ -1541,24 +1545,26 @@ struct ComputeHandle {
     // microscaling, which TensorRT-RTX requires to be channel-last (NHWC). This hand-built ModelParser
     // trunk is NCHW, so FP4 can't be built here yet (it would fail deep in the builder). Reject early
     // with a clear message. FP8 works because it supports a layout-agnostic per-tensor scale.
-    // NVFP4 status (see buildFP4Conv1x1): NVFP4 now EXECUTES correctly on TensorRT-RTX. The recipe:
-    //  - beat the layout wall with a 3D reshape [N,C,H,W]->[N,C,H*W] (C becomes 2nd-to-last), so
-    //    block-16 microscaling passes the "block dim last/2nd-to-last" check without an NHWC trunk;
-    //  - dynamic block-quantize the activation (runtime FP8 scales) — fine at inference;
-    //  - BAKE the weights as pre-quantized FP4 (E2M1) + FP8 (E4M3) block-scale constants into an
-    //    IDequantize. Dynamic-quantizing the weights instead stays a runtime op and segfaults inside
-    //    libnvinfer; baked constants fold at build time and run cleanly.
-    // BUT two hard limits remain on this net: (1) the clean reshape only reaches 1x1 convs, and on
-    // those FP4 is *slower* than FP16 (reshape+quant overhead dominates the small convs) — the 3x3
-    // FLOP bulk needs an NHWC trunk; (2) FP4 post-training quantization is too lossy here (scoreLead
-    // error ~0.47 from the 1x1 convs alone), so a useful FP4 net would need quantization-aware
-    // training. So FP4 is not a practical win yet; reject unless explicitly opted in.
+    // NVFP4 status (see buildFP4Conv): NVFP4 EXECUTES correctly on TensorRT-RTX for any kernel size
+    // (activation reshaped so C is 2nd-to-last for block-16 dynamic quant; weights BAKED as FP4/FP8
+    // block-scale constants — dynamic-quantizing weights segfaults inside libnvinfer, baked constants
+    // fold at build). But it is NOT a practical win, and the reason is now measured, not guessed:
+    //  (1) SPEED. The reshapes/transposes that satisfy the block-layout rule prevent TensorRT from
+    //      fusing a native FP4 conv, so it dequantizes to FP16 and runs FP16 *plus* the reshape
+    //      overhead. Result: FP4 trunk = ~836 nnEvals/s at t=64 — SLOWER than FP16 (~991), FP8
+    //      (~1360), even CUDA (~961). Native FP4 tensor-core convs need a channels-last (NHWC) trunk
+    //      so no reshape breaks the fusion. There is no NCHW shortcut.
+    //  (2) ACCURACY. FP4 post-training quantization is far too lossy: quantizing the trunk costs
+    //      scoreLead ~0.54 / policy ~0.18 vs FP32 — unplayable. A usable FP4 net needs
+    //      quantization-aware training (a training-pipeline effort, not a backend one).
+    // So FP4 needs BOTH an NHWC trunk (speed) and QAT (accuracy); reject unless explicitly opted in.
     if(quantBits == 4 && !ctx->fp4Experimental)
       throw StringError(
-        "trtTrunkPrecision=fp4: NVFP4 now executes correctly (baked E2M1 weights + E4M3 block scales), "
-        "but on this net it only reaches 1x1 convs (slower than FP16) and FP4 PTQ is too lossy "
-        "(scoreLead ~0.47); a useful FP4 net needs an NHWC trunk for the 3x3 convs + quantization-aware "
-        "training. Use fp8 or fp16. (trtTrunkPrecisionExperimentalFp4=true runs the FP4 path anyway.)");
+        "trtTrunkPrecision=fp4: NVFP4 executes correctly (baked E2M1 weights + E4M3 block scales) but "
+        "is not a practical win — the NCHW reshapes needed for block layout stop TensorRT fusing native "
+        "FP4 convs, so it runs SLOWER than FP16, and FP4 PTQ is far too lossy (scoreLead ~0.54). A usable "
+        "FP4 net needs an NHWC trunk (for speed) + quantization-aware training (for accuracy). Use fp8 or "
+        "fp16. (trtTrunkPrecisionExperimentalFp4=true runs the FP4 path anyway.)");
 #else
     if(ctx->trunkQuantBits > 0)
       throw StringError("trtTrunkPrecision fp8/fp4 is only supported on TensorRT-RTX");
