@@ -142,6 +142,10 @@ struct ComputeContext {
   double fp8ActSigma;
   double fp8ActFloor;
   bool fp8ActAbsMean;
+  // SmoothQuant-style per-input-channel equalization for the FP8 trunk (see buildQuantizedConvLayer):
+  // migrate activation dynamic range into the weights so the fast per-tensor activation scale is as
+  // accurate as per-channel. 0 disables; ~0.5 is the usual balance point.
+  double fp8SmoothAlpha;
 };
 
 ComputeContext* NeuralNet::createComputeContext(
@@ -195,6 +199,7 @@ ComputeContext* NeuralNet::createComputeContext(
   context->fp8ActSigma = cfg.contains("trtFp8ActSigma") ? cfg.getDouble("trtFp8ActSigma") : 4.0;
   context->fp8ActFloor = cfg.contains("trtFp8ActFloor") ? cfg.getDouble("trtFp8ActFloor") : 0.5;
   context->fp8ActAbsMean = cfg.contains("trtFp8ActAbs") ? cfg.getBool("trtFp8ActAbs") : true;
+  context->fp8SmoothAlpha = cfg.contains("trtFp8SmoothAlpha") ? cfg.getDouble("trtFp8SmoothAlpha") : 0.0;
   return context;
 }
 
@@ -284,6 +289,7 @@ struct ModelParser {
   double fp8ActSigma = 4.0;   // FP8 per-tensor activation-scale tuning (see buildQuantizedConvLayer)
   double fp8ActFloor = 0.5;
   bool fp8ActAbsMean = true;
+  double fp8SmoothAlpha = 0.0;  // SmoothQuant-style channel equalization (0 = off)
   int quantBlockSize() const { return quantBits == 4 ? 16 : 32; }
   DataType quantType() const { return quantBits == 4 ? DataType::kFP4 : DataType::kFP8; }
   DataType quantScaleType() const { return quantBits == 4 ? DataType::kFP8 : DataType::kE8M0; }
@@ -354,13 +360,15 @@ struct ModelParser {
     int quantBits_,
     double fp8ActSigma_,
     double fp8ActFloor_,
-    bool fp8ActAbsMean_) {
+    bool fp8ActAbsMean_,
+    double fp8SmoothAlpha_) {
     model = make_unique<TRTModel>();
     useHalfTrunk = useHalfTrunk_;
     quantBits = quantBits_;
     fp8ActSigma = fp8ActSigma_;
     fp8ActFloor = fp8ActFloor_;
     fp8ActAbsMean = fp8ActAbsMean_;
+    fp8SmoothAlpha = fp8SmoothAlpha_;
 
     model->nnXLen = nnXLen;
     model->nnYLen = nnYLen;
@@ -409,8 +417,8 @@ struct ModelParser {
       inputMaskHalf = castTensorTo(inputMask, DataType::kHALF);
     initMaskProcLayers();
     // Separate FP16/FP8/FP4 engines in the timing/plan cache: same net, different graph types.
-    tuneDesc += Global::strprintf(R"|("halftrunk"(%d)"quant"(%d)"fp8act"(%.3f,%.3f,%d))|",
-      useHalfTrunk ? 1 : 0, quantBits, fp8ActSigma, fp8ActFloor, fp8ActAbsMean ? 1 : 0);
+    tuneDesc += Global::strprintf(R"|("halftrunk"(%d)"quant"(%d)"fp8act"(%.3f,%.3f,%d)"smooth"(%.3f))|",
+      useHalfTrunk ? 1 : 0, quantBits, fp8ActSigma, fp8ActFloor, fp8ActAbsMean ? 1 : 0, fp8SmoothAlpha);
 
     auto trunk = buildTrunk(&modelDesc->trunk);
     buildPolicyHead(trunk->getOutput(0), &modelDesc->policyHead);
@@ -1102,18 +1110,51 @@ struct ModelParser {
       return fp4;  // may be nullptr for 3x3 -> buildConvLayer falls back to FP16
     }
     const int64_t nW = static_cast<int64_t>(desc->weights.size());
-    const int perOut = inC * kh * kw;
-    const double qMax = (quantBits == 4) ? 6.0 : 448.0;  // NVFP4 E2M1 max ~6, FP8 E4M3 max 448
+    const int elemsPerOut = kh * kw;
+    const double qMax = 448.0;  // FP8 E4M3 max
 
-    // Per-output-channel weight scale from the weights themselves (calibration-free).
+    // --- SmoothQuant per-input-channel equalization scale sc[c] (1.0 when disabled). ---
+    // Migrate the activation's dynamic range into the weights: the quantizer is fed a_c / sc_c and the
+    // weights are baked as W[o,c] * sc_c, so the product is unchanged but the per-tensor activation
+    // quantize sees near-uniform channel magnitudes (as accurate as per-channel, without the fusion-
+    // breaking per-channel quantize). sc_c = actMag_c^alpha / weightMag_c^(1-alpha), the standard
+    // SmoothQuant balance. Needs the preceding folded BN (activation magnitude) and the weights.
+    auto sc = make_unique<double[]>(inC);
+    for(int c = 0; c < inC; c++) sc[c] = 1.0;
+    const bool smooth = (fp8SmoothAlpha > 0.0 && actBN != nullptr && actBN->numChannels == inC);
+    auto actMagOf = [&](int c) {
+      double ms = actBN->mergedScale[c], mb = actBN->mergedBias[c];
+      double meanV = ms * actBN->mean[c] + mb;
+      double stdV = fabs(ms) * sqrt((double)actBN->variance[c] + actBN->epsilon);
+      return (fp8ActAbsMean ? fabs(meanV) : fmax(meanV, 0.0)) + fp8ActSigma * stdV + fp8ActFloor;
+    };
+    if(smooth) {
+      for(int c = 0; c < inC; c++) {
+        double wMag = 1e-12;
+        for(int o = 0; o < outC; o++)
+          for(int e = 0; e < elemsPerOut; e++) {
+            double v = fabs(desc->weights[((size_t)o * inC + c) * elemsPerOut + e]);
+            if(v > wMag) wMag = v;
+          }
+        double s = pow(fmax(actMagOf(c), 1e-6), fp8SmoothAlpha) / pow(wMag, 1.0 - fp8SmoothAlpha);
+        sc[c] = (s > 1e-8 && s < 1e8) ? s : 1.0;
+      }
+    }
+
+    // --- Weights, equalized (W[o,c] *= sc_c), FP8 with a per-output-channel scale. ---
     auto wscale = make_unique<float[]>(outC);
+    auto whalf = make_unique<__half[]>(nW);
     for(int o = 0; o < outC; o++) {
       float m = 1e-12f;
-      for(int i = 0; i < perOut; i++) { float v = fabsf(desc->weights[(size_t)o * perOut + i]); if(v > m) m = v; }
+      for(int c = 0; c < inC; c++)
+        for(int e = 0; e < elemsPerOut; e++) {
+          size_t j = ((size_t)o * inC + c) * elemsPerOut + e;
+          float w = desc->weights[j] * static_cast<float>(sc[c]);
+          whalf[j] = __float2half(w);
+          float a = fabsf(w); if(a > m) m = a;
+        }
       wscale[o] = m / static_cast<float>(qMax);
     }
-    auto whalf = make_unique<__half[]>(nW);
-    for(int64_t i = 0; i < nW; i++) whalf[i] = __float2half(desc->weights[i]);
     auto wConst = net->addConstant(Dims4(outC, inC, kh, kw), nvinfer1::Weights{DataType::kHALF, whalf.get(), nW});
     // Per-output-channel (axis 0) quantization wants a 1D scale of length outC; a 4D scale would be
     // read as block quantization (which requires channel-last layout this NCHW trunk doesn't have).
@@ -1140,29 +1181,42 @@ struct ModelParser {
     // stats (no calibration data / extra forward pass):
     //   post-BN pre-activation  v_c ~ N(mergedScale_c*mean_c + mergedBias_c, (mergedScale_c)^2*var_c)
     // Bias conservative (~6 sigma + floor): clipping spikes policy/score error far worse than coarseness.
+    // Per-tensor scalar over the EQUALIZED activation magnitude (actMag_c / sc_c): with smoothing on,
+    // the sc_c divide flattens the channel spread so this single scalar fits every channel tightly.
     double actScalar;
     if(actBN != nullptr && actBN->numChannels == inC) {
       double mx = 0.35;
       for(int c = 0; c < inC; c++) {
-        double ms = actBN->mergedScale[c], mb = actBN->mergedBias[c];
-        double meanV = ms * actBN->mean[c] + mb;
-        double stdV = fabs(ms) * sqrt((double)actBN->variance[c] + actBN->epsilon);
-        // base(meanV): |meanV| over-sizes channels with a negative pre-activation mean (post-mish they
-        // produce ~0), which inflates the shared per-tensor scalar and coarsens every channel. The
-        // positive-only base (fp8ActAbsMean=false) avoids that; sigma trades clipping vs coarseness.
-        double base = fp8ActAbsMean ? fabs(meanV) : fmax(meanV, 0.0);
-        double actMax = base + fp8ActSigma * stdV + fp8ActFloor;
+        double actMax = actMagOf(c) / sc[c];
         if(actMax > mx) mx = actMax;
       }
       actScalar = mx / qMax;
     } else {
       actScalar = 8.0 / qMax;  // untuned fallback when the preceding BN isn't known
     }
+
+    // Equalize the activation: multiply by 1/sc_c per channel before quantizing. This is a pointwise
+    // per-channel Scale that TensorRT folds into the preceding activation op, so the fast per-tensor
+    // Quantize->conv fusion is preserved (unlike a per-channel *Quantize*, which is not fusable).
+    ITensor* qin = input;
+    if(smooth) {
+      auto invsc = make_unique<__half[]>(inC);
+      for(int c = 0; c < inC; c++) invsc[c] = __float2half((float)(1.0 / sc[c]));
+      auto eq = net->addScale(
+        *input, ScaleMode::kCHANNEL,
+        nvinfer1::Weights{DataType::kHALF, nullptr, 0},
+        nvinfer1::Weights{DataType::kHALF, invsc.get(), inC},
+        nvinfer1::Weights{DataType::kHALF, nullptr, 0});
+      eq->setName((desc->name + "/smooth").c_str());
+      model->extraHalfWeights.push_back(move(invsc));
+      qin = eq->getOutput(0);
+    }
+
     auto ascaleBuf = make_unique<float[]>(1);
     ascaleBuf[0] = static_cast<float>(actScalar);
     auto aScaleConst = net->addConstant(Dims{0, {}}, nvinfer1::Weights{DataType::kFLOAT, ascaleBuf.get(), 1});
     model->extraWeights.push_back(move(ascaleBuf));
-    auto aQ = net->addQuantize(*input, *aScaleConst->getOutput(0), quantType());
+    auto aQ = net->addQuantize(*qin, *aScaleConst->getOutput(0), quantType());
     aQ->setName((desc->name + "/aq").c_str());
     auto aDQ = net->addDequantize(*aQ->getOutput(0), *aScaleConst->getOutput(0), DataType::kHALF);
     aDQ->setName((desc->name + "/adq").c_str());
@@ -1735,7 +1789,7 @@ struct ComputeHandle {
       auto modelParser = make_unique<ModelParser>();
       model = modelParser->build(
         move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen, halfTrunk, quantBits,
-        ctx->fp8ActSigma, ctx->fp8ActFloor, ctx->fp8ActAbsMean);
+        ctx->fp8ActSigma, ctx->fp8ActFloor, ctx->fp8ActAbsMean, ctx->fp8SmoothAlpha);
     }
     debugOutputs = model->debugOutputs;
     config->addOptimizationProfile(profile);

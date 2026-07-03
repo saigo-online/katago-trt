@@ -120,6 +120,14 @@ Two results:
 **Bottom line: ship FP8 (σ=4). It's ~free per visit and +108 Elo in real timed play.** The lesson:
 validate quantization with a gauntlet, not spot net-eval diffs — the difference here was −78 Elo.
 
+**SmoothQuant channel equalization** (`trtFp8SmoothAlpha`, default off) is also implemented: it migrates
+per-input-channel activation range into the weights (`a_c/s_c`, `W[o,c]·s_c`, `s_c = actMagᵃ/weightMag¹⁻ᵃ`)
+so the fast *per-tensor* activation scale becomes as accurate as per-channel. It works — the equalization
+`Scale` folds into the preceding pointwise op, so it costs only ~4% (not the ~30% a per-channel *quantize*
+costs), and α=0.5 cuts the 80-position winrate error ~18%. But since σ=4 already reaches parity on b28,
+the net effect here is ~a wash (small accuracy gain ≈ small speed loss); it's kept off by default and is
+there for nets with worse channel-magnitude spread (the classic SmoothQuant win case).
+
 ## Going below FP16: FP8 and FP4 on the Blackwell tensor cores
 
 The GB10's peak throughput is at 4-bit (NVFP4); FP8 is the intermediate rung. Both are wired
