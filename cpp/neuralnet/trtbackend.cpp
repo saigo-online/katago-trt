@@ -135,6 +135,13 @@ struct ComputeContext {
   string dumpDebugPlanToDir;  // if non-empty, dump emitted ONNX + built-engine layer info here (debug)
   int trunkQuantBits;    // 0 = FP16 trunk; 8 = MXFP8; 4 = NVFP4 (TensorRT-RTX ModelParser only)
   bool fp4Experimental;  // opt in to the (currently RTX-crashing) NVFP4 experiment
+  // FP8 per-tensor activation-scale tuning (see buildQuantizedConvLayer): the conv's scalar is
+  // sized to max_c( base(mean_v_c) + sigma*std_v_c + floor ). Smaller sigma / positive-only base =
+  // tighter (finer) quantization but more clipping risk. Defaults reproduce the original conservative
+  // scale; sweep via trtFp8ActSigma / trtFp8ActFloor / trtFp8ActAbs to trade accuracy vs clipping.
+  double fp8ActSigma;
+  double fp8ActFloor;
+  bool fp8ActAbsMean;
 };
 
 ComputeContext* NeuralNet::createComputeContext(
@@ -185,6 +192,9 @@ ComputeContext* NeuralNet::createComputeContext(
     else if(p != "fp16" && p != "") throw StringError("trtTrunkPrecision must be fp16, fp8, or fp4");
   }
   context->fp4Experimental = cfg.contains("trtTrunkPrecisionExperimentalFp4") && cfg.getBool("trtTrunkPrecisionExperimentalFp4");
+  context->fp8ActSigma = cfg.contains("trtFp8ActSigma") ? cfg.getDouble("trtFp8ActSigma") : 4.0;
+  context->fp8ActFloor = cfg.contains("trtFp8ActFloor") ? cfg.getDouble("trtFp8ActFloor") : 0.5;
+  context->fp8ActAbsMean = cfg.contains("trtFp8ActAbs") ? cfg.getBool("trtFp8ActAbs") : true;
   return context;
 }
 
@@ -271,6 +281,9 @@ struct ModelParser {
   // the big residual convs whose in-channels divide the block size run in FP8/FP4 on the Blackwell
   // tensor cores; every other layer keeps the FP16/FP32 treatment. Implies useHalfTrunk.
   int quantBits = 0;
+  double fp8ActSigma = 4.0;   // FP8 per-tensor activation-scale tuning (see buildQuantizedConvLayer)
+  double fp8ActFloor = 0.5;
+  bool fp8ActAbsMean = true;
   int quantBlockSize() const { return quantBits == 4 ? 16 : 32; }
   DataType quantType() const { return quantBits == 4 ? DataType::kFP4 : DataType::kFP8; }
   DataType quantScaleType() const { return quantBits == 4 ? DataType::kFP8 : DataType::kE8M0; }
@@ -338,10 +351,16 @@ struct ModelParser {
     int maxBatchSize,
     bool requireExactNNLen,
     bool useHalfTrunk_,
-    int quantBits_) {
+    int quantBits_,
+    double fp8ActSigma_,
+    double fp8ActFloor_,
+    bool fp8ActAbsMean_) {
     model = make_unique<TRTModel>();
     useHalfTrunk = useHalfTrunk_;
     quantBits = quantBits_;
+    fp8ActSigma = fp8ActSigma_;
+    fp8ActFloor = fp8ActFloor_;
+    fp8ActAbsMean = fp8ActAbsMean_;
 
     model->nnXLen = nnXLen;
     model->nnYLen = nnYLen;
@@ -390,7 +409,8 @@ struct ModelParser {
       inputMaskHalf = castTensorTo(inputMask, DataType::kHALF);
     initMaskProcLayers();
     // Separate FP16/FP8/FP4 engines in the timing/plan cache: same net, different graph types.
-    tuneDesc += Global::strprintf(R"|("halftrunk"(%d)"quant"(%d))|", useHalfTrunk ? 1 : 0, quantBits);
+    tuneDesc += Global::strprintf(R"|("halftrunk"(%d)"quant"(%d)"fp8act"(%.3f,%.3f,%d))|",
+      useHalfTrunk ? 1 : 0, quantBits, fp8ActSigma, fp8ActFloor, fp8ActAbsMean ? 1 : 0);
 
     auto trunk = buildTrunk(&modelDesc->trunk);
     buildPolicyHead(trunk->getOutput(0), &modelDesc->policyHead);
@@ -1127,7 +1147,11 @@ struct ModelParser {
         double ms = actBN->mergedScale[c], mb = actBN->mergedBias[c];
         double meanV = ms * actBN->mean[c] + mb;
         double stdV = fabs(ms) * sqrt((double)actBN->variance[c] + actBN->epsilon);
-        double actMax = fabs(meanV) + 6.0 * stdV + 0.5;  // conservative: clipping hurts more than coarseness
+        // base(meanV): |meanV| over-sizes channels with a negative pre-activation mean (post-mish they
+        // produce ~0), which inflates the shared per-tensor scalar and coarsens every channel. The
+        // positive-only base (fp8ActAbsMean=false) avoids that; sigma trades clipping vs coarseness.
+        double base = fp8ActAbsMean ? fabs(meanV) : fmax(meanV, 0.0);
+        double actMax = base + fp8ActSigma * stdV + fp8ActFloor;
         if(actMax > mx) mx = actMax;
       }
       actScalar = mx / qMax;
@@ -1710,7 +1734,8 @@ struct ComputeHandle {
     else {
       auto modelParser = make_unique<ModelParser>();
       model = modelParser->build(
-        move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen, halfTrunk, quantBits);
+        move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen, halfTrunk, quantBits,
+        ctx->fp8ActSigma, ctx->fp8ActFloor, ctx->fp8ActAbsMean);
     }
     debugOutputs = model->debugOutputs;
     config->addOptimizationProfile(profile);

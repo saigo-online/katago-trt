@@ -94,6 +94,32 @@ builder opt-level 5, cache cleared per run:
 near-FP16 accuracy (scoreLead within ~0.08 of FP32). `cudabackend.cpp` is unmodified upstream, so
 this is a fair TRT-vs-stock comparison.
 
+## Strength: FP8 vs stock CUDA (Elo gauntlet)
+
+Speed is only half the story — does FP8's quantization *cost playing strength*? Head-to-head
+gauntlet, b28 @ 19×19, same net, resignation on, differing only in backend/precision (via the
+`tools/gauntlet` harness):
+
+| condition | FP8 – CUDA | Elo | significance |
+|---|---|---|---|
+| equal **visits**, σ=6 (old scale) | 39–61 | **−78** | z=−2.2 (significant) |
+| equal **visits**, σ=4 (tuned scale) | 45–35 | **+44** | z=1.12 (not significant → ~parity) |
+| equal **wall-clock** (0.25 s/move), σ=4 | 65–35 | **+108** | z=3.0 (significant) |
+
+Two results:
+
+1. **Per-visit, FP8 is ~lossless with the tuned scale.** At a *fixed visit count* the original
+   conservative activation scale (σ=6) cost a real, significant **−78 Elo** — a single-position
+   net-eval diff badly understated the damage that accumulates through search. Tuning the per-tensor
+   activation scale to σ=4 (`trtFp8ActSigma`, sized from the folded-BN stats over 80 real game
+   positions) erased it: FP8 is now statistically even with CUDA at equal visits (+44, not
+   significant; FP8 is a lossy copy of the same net so it can't truly exceed FP16 — read as parity).
+2. **Per-second, FP8 wins decisively: +108 Elo, z=3.0.** At equal *wall-clock*, FP8's ~1.4× speed
+   does ~1.4× the visits, and that converts straight into strength via KataGo's time management.
+
+**Bottom line: ship FP8 (σ=4). It's ~free per visit and +108 Elo in real timed play.** The lesson:
+validate quantization with a gauntlet, not spot net-eval diffs — the difference here was −78 Elo.
+
 ## Going below FP16: FP8 and FP4 on the Blackwell tensor cores
 
 The GB10's peak throughput is at 4-bit (NVFP4); FP8 is the intermediate rung. Both are wired

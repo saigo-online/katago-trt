@@ -16,8 +16,10 @@ reductions/heads) and adds an optional **FP8** quantized trunk for the Blackwell
 cores.
 
 > **Status (b28c512nbt @ 19×19, NVIDIA GB10, CUDA 13, TensorRT-RTX 11.0.0.114):**
-> **FP8 runs KataGo ~1.4–1.7× faster than the stock CUDA backend** (e.g. +71 % at batch 16),
-> at near-FP16 accuracy (scoreLead within ~0.08 of FP32). **FP16** matches or edges CUDA FP16 at
+> **FP8 runs KataGo ~1.4–1.7× faster than the stock CUDA backend** (e.g. +71 % at batch 16), and an
+> Elo gauntlet confirms **+108 Elo vs stock CUDA at equal wall-clock** (z=3.0) — with the tuned σ=4
+> activation scale it's statistically even at equal *visits*, so the speed is ~free strength.
+> **FP16** matches or edges CUDA FP16 at
 > batch ≥ 32 and is the most accurate non-reference engine (winrate within ~1e-3 of FP32).
 > **FP4 (NVFP4)** executes on RTX but isn't a practical win yet (see below). Full numbers,
 > the correctness table, and the porting story are in [`bench/RESULTS.md`](bench/RESULTS.md).
