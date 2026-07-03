@@ -4,12 +4,17 @@
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>  // __half / __float2half, for emitting FP16 weights on strongly-typed builds
+#include <cuda_fp8.h>   // __nv_cvt_float_to_fp8, for NVFP4 weights' FP8 (E4M3) block scales
+#include <cuda_fp4.h>   // __nv_cvt_float_to_fp4, for baking NVFP4 (E2M1) weight constants
 
 #include <atomic>
 #include <cstdint>
 #include <fstream>
 #include <random>
+#include <map>
 #include <set>
+#include <utility>
 
 #include "../core/fileutils.h"
 #include "../core/makedir.h"
@@ -25,6 +30,53 @@
 
 using namespace std;
 using namespace nvinfer1;
+
+// ---- TensorRT-RTX portability ---------------------------------------------------------------
+// TensorRT-RTX (the SDK shipped on DGX Spark / GB10, versioned 11.x via TRT_*_ENTERPRISE) does
+// fully automatic mixed precision. Relative to mainline TensorRT it removed:
+//   * per-layer precision control  - ILayer::setPrecision / setOutputType, ITensor::setType
+//   * the global FP16 switch        - BuilderFlag::kFP16 and IBuilder::platformHasFastFp16()
+//   * precision constraints         - BuilderFlag::kOBEY_/kPREFER_PRECISION_CONSTRAINTS
+// There is no way to request FP16 globally or to pin a layer's precision; RTX selects precision
+// per layer to preserve accuracy and exposes only kTF32 for Tensor-Core acceleration of FP32
+// math. This backend builds the graph with FP32 weights and FP32 inputs/outputs and introduces
+// no FP16 tensors, so on RTX the engine runs in FP32/TF32 and the FP32-pinning calls below are
+// redundant no-ops. Explicit addCast nodes are real graph structure and are still honored, so the
+// head/gpool FP32 casts remain in force. Detected by version (mainline is <= 10 as of 2026); the
+// CMake TensorRT block can also force KATAGO_TRT_RTX via a compile definition.
+#ifndef KATAGO_TRT_RTX
+  #if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 11
+    #define KATAGO_TRT_RTX 1
+  #else
+    #define KATAGO_TRT_RTX 0
+  #endif
+#endif
+
+namespace {
+// Pin a layer / tensor to FP32 on mainline TensorRT; no-op on TensorRT-RTX (automatic precision).
+inline void trtSetLayerFP32(ILayer* layer) {
+#if !KATAGO_TRT_RTX
+  layer->setPrecision(DataType::kFLOAT);
+#else
+  (void)layer;
+#endif
+}
+inline void trtSetLayerOutputFP32(ILayer* layer, int outputIndex) {
+#if !KATAGO_TRT_RTX
+  layer->setOutputType(outputIndex, DataType::kFLOAT);
+#else
+  (void)layer;
+  (void)outputIndex;
+#endif
+}
+inline void trtSetTensorFP32(ITensor* tensor) {
+#if !KATAGO_TRT_RTX
+  tensor->setType(DataType::kFLOAT);
+#else
+  (void)tensor;
+#endif
+}
+}  // namespace
 
 // Define this to print out some of the intermediate values of the neural net
 //#define DEBUG_INTERMEDIATE_VALUES
@@ -81,6 +133,8 @@ struct ComputeContext {
   bool useOnnx;          // build via the ONNX emitter (default true); false = hand-built ModelParser
   bool transformerNHWC;  // ONNX emitter: run transformer blocks channel-last (default true)
   string dumpDebugPlanToDir;  // if non-empty, dump emitted ONNX + built-engine layer info here (debug)
+  int trunkQuantBits;    // 0 = FP16 trunk; 8 = MXFP8; 4 = NVFP4 (TensorRT-RTX ModelParser only)
+  bool fp4Experimental;  // opt in to the (currently RTX-crashing) NVFP4 experiment
 };
 
 ComputeContext* NeuralNet::createComputeContext(
@@ -116,6 +170,21 @@ ComputeContext* NeuralNet::createComputeContext(
   // multiple engines built in one process (e.g. an FP16 and an FP32 evaluator) don't overwrite each
   // other. Off by default; only for investigating numerical/precision issues in the TRT graph.
   context->dumpDebugPlanToDir = cfg.contains("trtDumpDebugPlanToDir") ? cfg.getString("trtDumpDebugPlanToDir") : "";
+  // Optional low-precision trunk on Blackwell / TensorRT-RTX: quantize the big residual convs to
+  // MXFP8 (block-32) or NVFP4 (block-16) microscaling, which is where the GB10 tensor cores peak.
+  // Weights use a per-output-channel static scale (derived from the weights, no calibration); the
+  // activation is block-quantized dynamically at runtime (also calibration-free). Only applied to
+  // convs whose input-channel count is divisible by the block size; everything else stays FP16, and
+  // reductions/heads stay FP32. Requires the ModelParser path (trtDisableOnnx=true) + FP16 trunk.
+  //   trtTrunkPrecision = fp16 (default) | fp8 | fp4
+  context->trunkQuantBits = 0;
+  if(cfg.contains("trtTrunkPrecision")) {
+    string p = Global::toLower(Global::trim(cfg.getString("trtTrunkPrecision")));
+    if(p == "fp8") context->trunkQuantBits = 8;
+    else if(p == "fp4") context->trunkQuantBits = 4;
+    else if(p != "fp16" && p != "") throw StringError("trtTrunkPrecision must be fp16, fp8, or fp4");
+  }
+  context->fp4Experimental = cfg.contains("trtTrunkPrecisionExperimentalFp4") && cfg.getBool("trtTrunkPrecisionExperimentalFp4");
   return context;
 }
 
@@ -158,6 +227,12 @@ struct TRTModel {
   // TensorRT keeps only reference to weights before engine is built
   const LoadedModel* rawModel;
   vector<unique_ptr<float[]>> extraWeights;
+  // FP16 copies of trunk weights for strongly-typed half-precision builds (TensorRT-RTX). Kept here
+  // (same lifetime as extraWeights) because TensorRT only references weight memory until the engine
+  // is serialized.
+  vector<unique_ptr<__half[]>> extraHalfWeights;
+  // Raw FP8 (E4M3) bytes for NVFP4 weight block scales; same lifetime rationale as above.
+  vector<unique_ptr<uint8_t[]>> extraFp8Weights;
 
   int modelVersion;
   uint8_t tuneHash[32];
@@ -179,12 +254,72 @@ struct ModelParser {
   ITensor* inputSpatial;
   ITensor* inputGlobal;
   ITensor* inputMeta;
+  ITensor* inputMaskHalf = nullptr;  // FP16 view of inputMask, for the half-precision trunk
 
   ILayer* maskSumLayer;
   ILayer* maskScaleLayer;
   ILayer* maskQuadLayer;
 
+  // When true, build the trunk (and any layer whose helper is called with forceFP32=false) in FP16
+  // and keep the numerically-sensitive reductions/heads (forceFP32=true) in FP32. Used on strongly-
+  // typed TensorRT-RTX to get Tensor-Core FP16 throughput while preserving head accuracy. The
+  // forceFP32 flag threaded through every build helper already partitions the graph exactly along
+  // this FP16/FP32 boundary, and the existing applyCastLayer(kFLOAT) calls sit on the crossing points.
+  bool useHalfTrunk = false;
+
+  // 0 = FP16 trunk; 8 = MXFP8 (block 32, E8M0 scales); 4 = NVFP4 (block 16, FP8 scales). When set,
+  // the big residual convs whose in-channels divide the block size run in FP8/FP4 on the Blackwell
+  // tensor cores; every other layer keeps the FP16/FP32 treatment. Implies useHalfTrunk.
+  int quantBits = 0;
+  int quantBlockSize() const { return quantBits == 4 ? 16 : 32; }
+  DataType quantType() const { return quantBits == 4 ? DataType::kFP4 : DataType::kFP8; }
+  DataType quantScaleType() const { return quantBits == 4 ? DataType::kFP8 : DataType::kE8M0; }
+
   string tuneDesc;  // Serves as a hash of the network architecture specific to tuning
+
+  // The compute/weight type for a layer: FP16 in the trunk, FP32 for forced-FP32 reductions/heads.
+  DataType typeFor(bool forceFP32) const {
+    return (useHalfTrunk && !forceFP32) ? DataType::kHALF : DataType::kFLOAT;
+  }
+
+  // Build a Weights struct in the layer's type. FP32 layers (or non-half builds) reference the
+  // caller's float array directly; FP16 trunk layers get a converted __half copy stashed on the model.
+  nvinfer1::Weights weightsFor(const float* data, int64_t count, bool forceFP32) {
+    if(typeFor(forceFP32) != DataType::kHALF)
+      return nvinfer1::Weights{DataType::kFLOAT, data, count};
+    auto buf = make_unique<__half[]>(count);
+    for(int64_t i = 0; i < count; i++)
+      buf[i] = __float2half(data[i]);
+    nvinfer1::Weights w{DataType::kHALF, buf.get(), count};
+    model->extraHalfWeights.push_back(move(buf));
+    return w;
+  }
+
+  // Empty (no-op) Weights typed to match the layer, so strongly-typed builders don't reject a
+  // type-mismatched bias/scale/power slot.
+  nvinfer1::Weights emptyWeightsFor(bool forceFP32) {
+    return nvinfer1::Weights{typeFor(forceFP32), nullptr, 0};
+  }
+
+  // Cast a tensor to the given type only if a cast is actually needed; identity otherwise. Used to
+  // bring the shared FP32 mask-derived tensors into the FP16 trunk (and vice versa) at the exact
+  // ops that consume them, keeping every strongly-typed operator's inputs type-consistent. Casts are
+  // cached per (tensor,type) so the shared mask tensors get a single reused cast rather than one per
+  // consuming block (which would bloat the graph and collide on layer names).
+  map<pair<ITensor*, int>, ITensor*> castCache;
+  ITensor* castTensorTo(ITensor* t, DataType type) {
+    if(t->getType() == type)
+      return t;
+    auto key = make_pair(t, static_cast<int>(type));
+    auto it = castCache.find(key);
+    if(it != castCache.end())
+      return it->second;
+    auto c = model->network->addCast(*t, type);
+    c->setName((string(t->getName()) + "/rtxcast" + (type == DataType::kHALF ? "16" : "32")).c_str());
+    ITensor* out = c->getOutput(0);
+    castCache[key] = out;
+    return out;
+  }
 
   ModelParser() = default;
   ModelParser(const ModelParser&) = delete;
@@ -192,7 +327,7 @@ struct ModelParser {
 
   // Bump this when between katago versions we want to forcibly drop old timing caches and plan caches.
   // Bumped 7->8 for the TensorRT ONNX overhaul (ONNX emitter as default path, NHWC trunk, FP32 pinning).
-  static constexpr int tuneSalt = 8;
+  static constexpr int tuneSalt = 9;
 
   unique_ptr<TRTModel> build(
     unique_ptr<INetworkDefinition> net,
@@ -201,8 +336,12 @@ struct ModelParser {
     int nnXLen,
     int nnYLen,
     int maxBatchSize,
-    bool requireExactNNLen) {
+    bool requireExactNNLen,
+    bool useHalfTrunk_,
+    int quantBits_) {
     model = make_unique<TRTModel>();
+    useHalfTrunk = useHalfTrunk_;
+    quantBits = quantBits_;
 
     model->nnXLen = nnXLen;
     model->nnYLen = nnYLen;
@@ -245,7 +384,13 @@ struct ModelParser {
     network->setName(modelDesc->name.c_str());
 
     initInputs();
+    // Precompute an FP16 view of the mask for the half-precision trunk. Reductions/heads keep the
+    // FP32 inputMask; trunk mask-multiplies use this one so both operands share a type.
+    if(useHalfTrunk)
+      inputMaskHalf = castTensorTo(inputMask, DataType::kHALF);
     initMaskProcLayers();
+    // Separate FP16/FP8/FP4 engines in the timing/plan cache: same net, different graph types.
+    tuneDesc += Global::strprintf(R"|("halftrunk"(%d)"quant"(%d))|", useHalfTrunk ? 1 : 0, quantBits);
 
     auto trunk = buildTrunk(&modelDesc->trunk);
     buildPolicyHead(trunk->getOutput(0), &modelDesc->policyHead);
@@ -267,12 +412,12 @@ struct ModelParser {
     } else {
       debugOutputLayer = network->addIdentity(*tensor);
     }
-    debugOutputLayer->setOutputType(0, DataType::kFLOAT);
+    trtSetLayerOutputFP32(debugOutputLayer, 0);
     string debugOutputName = "DBG" + to_string(hash<string>{}(description));
     auto debugOutput = debugOutputLayer->getOutput(0);
     network->markOutput(*debugOutput);
     debugOutput->setName(debugOutputName.c_str());
-    debugOutput->setType(DataType::kFLOAT);
+    trtSetTensorFP32(debugOutput);
     debugOutput->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
     model->debugOutputs.emplace_back(debugOutputName, description);
 #else
@@ -367,11 +512,11 @@ struct ModelParser {
     if(!model->requireExactNNLen) {
       maskSumLayer = network->addReduce(*inputMask, ReduceOperation::kSUM, 1U << 2 | 1U << 3, true);
       maskSumLayer->setName("InputMask/sum");
-      maskSumLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(maskSumLayer);
 
       auto maskWidthLayer = network->addUnary(*maskSumLayer->getOutput(0), UnaryOperation::kSQRT);
       maskWidthLayer->setName("InputMask/width");
-      maskWidthLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(maskWidthLayer);
 
       auto maskScaleWeightsShift = make_unique<float[]>(1);
       auto maskScaleWeightsScale = make_unique<float[]>(1);
@@ -384,7 +529,7 @@ struct ModelParser {
         {DataType::kFLOAT, maskScaleWeightsScale.get(), 1},
         {DataType::kFLOAT, nullptr, 0});
       maskScaleLayer->setName("InputMask/scale");
-      maskScaleLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(maskScaleLayer);
       model->extraWeights.push_back(move(maskScaleWeightsShift));
       model->extraWeights.push_back(move(maskScaleWeightsScale));
 
@@ -399,7 +544,7 @@ struct ModelParser {
         {DataType::kFLOAT, nullptr, 0},
         {DataType::kFLOAT, maskCenterSquareWeightsPower.get(), 1});
       maskCenterSquareLayer->setName("InputMask/centersquare");
-      maskCenterSquareLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(maskCenterSquareLayer);
       model->extraWeights.push_back(move(maskCenterSquareWeightsShift));
       model->extraWeights.push_back(move(maskCenterSquareWeightsPower));
 
@@ -414,7 +559,7 @@ struct ModelParser {
         {DataType::kFLOAT, maskQuadWeightsScale.get(), 1},
         {DataType::kFLOAT, nullptr, 0});
       maskQuadLayer->setName("InputMask/quad");
-      maskQuadLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(maskQuadLayer);
       model->extraWeights.push_back(move(maskQuadWeightsShift));
       model->extraWeights.push_back(move(maskQuadWeightsScale));
     } else {
@@ -449,11 +594,16 @@ struct ModelParser {
       desc->regularNumChannels,
       desc->gpoolNumChannels);
 
-    auto initialConvLayer = buildConvLayer(inputSpatial, &desc->initialConv);
-    auto initialMatMulLayer = buildMatMulLayer(inputGlobal, &desc->initialMatMul);
+    // The trunk runs in FP16 when useHalfTrunk; the network inputs are FP32 (the host feeds FP32
+    // buffers), so cast them to FP16 at the trunk entry to match the FP16 weights.
+    ITensor* trunkSpatial = useHalfTrunk ? castTensorTo(inputSpatial, DataType::kHALF) : inputSpatial;
+    ITensor* trunkGlobal = useHalfTrunk ? castTensorTo(inputGlobal, DataType::kHALF) : inputGlobal;
+    auto initialConvLayer = buildConvLayer(trunkSpatial, &desc->initialConv);
+    auto initialMatMulLayer = buildMatMulLayer(trunkGlobal, &desc->initialMatMul);
     ILayer* initialMetaLayer;
     if(desc->metaEncoderVersion > 0) {
-      initialMetaLayer = buildSGFMetadataEncoder(inputMeta, &desc->sgfMetadataEncoder);
+      ITensor* trunkMeta = useHalfTrunk ? castTensorTo(inputMeta, DataType::kHALF) : inputMeta;
+      initialMetaLayer = buildSGFMetadataEncoder(trunkMeta, &desc->sgfMetadataEncoder);
     }
     else {
       initialMetaLayer = NULL;
@@ -545,7 +695,7 @@ struct ModelParser {
       *p1CastLayer->getOutput(0), *gpoolToBiasMulLayer->getOutput(0), ElementWiseOperation::kSUM);
     auto gpoolBiasLayerName = name + "/gpbias";
     gpoolBiasLayer->setName(gpoolBiasLayerName.c_str());
-    gpoolBiasLayer->setPrecision(DataType::kFLOAT);
+    trtSetLayerFP32(gpoolBiasLayer);
     auto p1BatchNormLayer = buildBatchNormLayer(gpoolBiasLayer->getOutput(0), &desc->p1BN, true);
     auto p1ActivationLayer = buildActivationLayer(p1BatchNormLayer->getOutput(0), &desc->p1Activation, true);
     auto p1MaskLayer = applyMaskLayer(p1ActivationLayer, true);
@@ -561,35 +711,35 @@ struct ModelParser {
     testAssert(desc->p2Conv.convYSize == 1);
 
     auto p2ConvLayer = buildConvLayer(p1MaskLayer->getOutput(0), &desc->p2Conv, true);
-    p2ConvLayer->setPrecision(DataType::kFLOAT);
+    trtSetLayerFP32(p2ConvLayer);
     if(model->modelVersion >= 15) {
       auto gpoolToPassMulLayer = buildMatMulLayer(gpoolLayer->getOutput(0), &desc->gpoolToPassMul, true);
-      gpoolToPassMulLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(gpoolToPassMulLayer);
       auto gpoolToPassBiasLayer = buildMatBiasLayer(gpoolToPassMulLayer->getOutput(0), &desc->gpoolToPassBias, true);
       auto gpoolToPassActLayer = buildActivationLayer(gpoolToPassBiasLayer->getOutput(0), &desc->passActivation, true);
       auto gpoolToPassMul2Layer = buildMatMulLayer(gpoolToPassActLayer->getOutput(0), &desc->gpoolToPassMul2, true);
-      gpoolToPassMul2Layer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(gpoolToPassMul2Layer);
 
       auto outputPolicyPass = gpoolToPassMul2Layer->getOutput(0);
       network->markOutput(*outputPolicyPass);
       outputPolicyPass->setName("OutputPolicyPass");
-      outputPolicyPass->setType(DataType::kFLOAT);
+      trtSetTensorFP32(outputPolicyPass);
       outputPolicyPass->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
     } else {
       auto gpoolToPassMulLayer = buildMatMulLayer(gpoolLayer->getOutput(0), &desc->gpoolToPassMul, true);
-      gpoolToPassMulLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(gpoolToPassMulLayer);
 
       auto outputPolicyPass = gpoolToPassMulLayer->getOutput(0);
       network->markOutput(*outputPolicyPass);
       outputPolicyPass->setName("OutputPolicyPass");
-      outputPolicyPass->setType(DataType::kFLOAT);
+      trtSetTensorFP32(outputPolicyPass);
       outputPolicyPass->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
     }
 
     auto outputPolicy = p2ConvLayer->getOutput(0);
     network->markOutput(*outputPolicy);
     outputPolicy->setName("OutputPolicy");
-    outputPolicy->setType(DataType::kFLOAT);
+    trtSetTensorFP32(outputPolicy);
     outputPolicy->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
   }
 
@@ -628,19 +778,19 @@ struct ModelParser {
     auto outputValue = v3BiasLayer->getOutput(0);
     network->markOutput(*outputValue);
     outputValue->setName("OutputValue");
-    outputValue->setType(DataType::kFLOAT);
+    trtSetTensorFP32(outputValue);
     outputValue->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
 
     auto outputScoreValue = sv3BiasLayer->getOutput(0);
     network->markOutput(*outputScoreValue);
     outputScoreValue->setName("OutputScoreValue");
-    outputScoreValue->setType(DataType::kFLOAT);
+    trtSetTensorFP32(outputScoreValue);
     outputScoreValue->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
 
     auto outputOwnership = vOwnershipCastLayer->getOutput(0);
     network->markOutput(*outputOwnership);
     outputOwnership->setName("OutputOwnership");
-    outputOwnership->setType(DataType::kFLOAT);
+    trtSetTensorFP32(outputOwnership);
     outputOwnership->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
 
     auto modelDesc = &model->rawModel->modelDesc;
@@ -667,11 +817,12 @@ struct ModelParser {
     auto preBatchNormLayer = buildBatchNormLayer(input, &desc->preBN);
     auto preActivationLayer = buildActivationLayer(preBatchNormLayer->getOutput(0), &desc->preActivation);
     auto preMaskLayer = applyMaskLayer(preActivationLayer);
-    auto regularConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->regularConv);
+    // The conv input is preBN -> act -> mask, so preBN's stats give this conv's activation range.
+    auto regularConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->regularConv, false, &desc->preBN);
     auto midBatchNormLayer = buildBatchNormLayer(regularConvLayer->getOutput(0), &desc->midBN);
     auto midActivationLayer = buildActivationLayer(midBatchNormLayer->getOutput(0), &desc->midActivation);
     auto midMaskLayer = applyMaskLayer(midActivationLayer);
-    auto finalConvLayer = buildConvLayer(midMaskLayer->getOutput(0), &desc->finalConv);
+    auto finalConvLayer = buildConvLayer(midMaskLayer->getOutput(0), &desc->finalConv, false, &desc->midBN);
 
     auto mergeLayer = model->network->addElementWise(*input, *finalConvLayer->getOutput(0), ElementWiseOperation::kSUM);
     mergeLayer->setName(desc->name.c_str());
@@ -687,8 +838,8 @@ struct ModelParser {
     auto preActivationLayer = buildActivationLayer(preBatchNormLayer->getOutput(0), &desc->preActivation);
     auto preMaskLayer = applyMaskLayer(preActivationLayer);
 
-    auto regularConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->regularConv);
-    auto gpoolConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->gpoolConv);
+    auto regularConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->regularConv, false, &desc->preBN);
+    auto gpoolConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->gpoolConv, false, &desc->preBN);
     auto gpoolBatchNormLayer = buildBatchNormLayer(gpoolConvLayer->getOutput(0), &desc->gpoolBN);
     auto gpoolActivationLayer = buildActivationLayer(gpoolBatchNormLayer->getOutput(0), &desc->gpoolActivation);
     auto gpoolMaskLayer = applyMaskLayer(gpoolActivationLayer);
@@ -703,7 +854,7 @@ struct ModelParser {
     auto midActivationLayer = buildActivationLayer(midBatchNormLayer->getOutput(0), &desc->midActivation);
     auto midMaskLayer = applyMaskLayer(midActivationLayer);
 
-    auto finalConvLayer = buildConvLayer(midMaskLayer->getOutput(0), &desc->finalConv);
+    auto finalConvLayer = buildConvLayer(midMaskLayer->getOutput(0), &desc->finalConv, false, &desc->midBN);
 
     auto mergeLayer = network->addElementWise(*input, *finalConvLayer->getOutput(0), ElementWiseOperation::kSUM);
     mergeLayer->setName(name.c_str());
@@ -717,12 +868,12 @@ struct ModelParser {
     auto preBatchNormLayer = buildBatchNormLayer(input, &desc->preBN);
     auto preActivationLayer = buildActivationLayer(preBatchNormLayer->getOutput(0), &desc->preActivation);
     auto preMaskLayer = applyMaskLayer(preActivationLayer);
-    auto preConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->preConv);
+    auto preConvLayer = buildConvLayer(preMaskLayer->getOutput(0), &desc->preConv, false, &desc->preBN);
     auto stackLayer = buildResidualBlockStack(preConvLayer->getOutput(0), desc->blocks, desc->name);
     auto postBatchNormLayer = buildBatchNormLayer(stackLayer->getOutput(0), &desc->postBN);
     auto postActivationLayer = buildActivationLayer(postBatchNormLayer->getOutput(0), &desc->postActivation);
     auto postMaskLayer = applyMaskLayer(postActivationLayer);
-    auto postConvLayer = buildConvLayer(postMaskLayer->getOutput(0), &desc->postConv);
+    auto postConvLayer = buildConvLayer(postMaskLayer->getOutput(0), &desc->postConv, false, &desc->postBN);
 
     auto mergeLayer = model->network->addElementWise(*input, *postConvLayer->getOutput(0), ElementWiseOperation::kSUM);
     mergeLayer->setName(desc->name.c_str());
@@ -753,12 +904,12 @@ struct ModelParser {
       *input,
       desc->outChannels,
       {2, {1, 1}},
-      {DataType::kFLOAT, transposedWeights.get(), static_cast<int64_t>(desc->weights.size())},
-      {DataType::kFLOAT, nullptr, 0});
+      weightsFor(transposedWeights.get(), static_cast<int64_t>(desc->weights.size()), forceFP32),
+      emptyWeightsFor(forceFP32));
     matMulLayer->setName(desc->name.c_str());
 
     if(forceFP32) {
-      matMulLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(matMulLayer);
     }
 
     model->extraWeights.push_back(move(transposedWeights));
@@ -777,19 +928,20 @@ struct ModelParser {
     auto matBiasLayer = model->network->addScale(
       *input,
       ScaleMode::kCHANNEL,
-      {DataType::kFLOAT, desc->weights.data(), static_cast<int64_t>(numChannels)},
-      {DataType::kFLOAT, nullptr, 0},
-      {DataType::kFLOAT, nullptr, 0});
+      weightsFor(desc->weights.data(), static_cast<int64_t>(numChannels), forceFP32),
+      emptyWeightsFor(forceFP32),
+      emptyWeightsFor(forceFP32));
     matBiasLayer->setName(desc->name.c_str());
 
     if(forceFP32) {
-      matBiasLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(matBiasLayer);
     }
 
     return matBiasLayer;
   }
 
-  ILayer* buildConvLayer(ITensor* input, const ConvLayerDesc* desc, bool forceFP32 = false) {
+  ILayer* buildConvLayer(ITensor* input, const ConvLayerDesc* desc, bool forceFP32 = false,
+                         const BatchNormLayerDesc* actBN = nullptr) {
     int convXSize = desc->convXSize;
     int convYSize = desc->convYSize;
     int dilationX = desc->dilationX;
@@ -810,21 +962,191 @@ struct ModelParser {
     testAssert(desc->weights.size() == convYSize * convXSize * numInChannels * numOutChannels);
     testAssert(input->getDimensions().d[1] == numInChannels);
 
+    // Low-precision (MXFP8 / NVFP4) path for the big trunk convs on Blackwell tensor cores. Only when
+    // quantization is on, this isn't a forced-FP32 layer, and the in-channel count divides the block
+    // size (microscaling needs the contraction dim block-aligned). Otherwise fall through to FP16/FP32.
+    if(quantBits > 0 && !forceFP32 && (numInChannels % quantBlockSize()) == 0) {
+      ILayer* q = buildQuantizedConvLayer(input, desc, actBN);
+      if(q != nullptr)
+        return q;
+    }
+
     auto convLayer = model->network->addConvolutionNd(
       *input,
       desc->outChannels,
       {2, {convYSize, convXSize}},
-      {DataType::kFLOAT, desc->weights.data(), static_cast<int64_t>(desc->weights.size())},
-      {DataType::kFLOAT, nullptr, 0});
+      weightsFor(desc->weights.data(), static_cast<int64_t>(desc->weights.size()), forceFP32),
+      emptyWeightsFor(forceFP32));
     convLayer->setDilationNd({2, {dilationY, dilationX}});
     convLayer->setPaddingMode(PaddingMode::kSAME_UPPER);
     convLayer->setName(desc->name.c_str());
 
     if(forceFP32) {
-      convLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(convLayer);
     }
 
     return convLayer;
+  }
+
+  // Experimental NVFP4 conv (block-16 microscaling) on the Blackwell FP4 tensor cores. The blocker
+  // for FP4 was that block quantization requires the blocked (channel/contraction) dim to be last or
+  // 2nd-to-last, which NCHW [N,C,H,W] is not. Reshaping the activation to [N, C, H*W] puts C at the
+  // 2nd-to-last position, so the block-16 dynamic quantize's layout check passes without transposing
+  // the whole trunk. Weights are baked as pre-quantized FP4+FP8-scale constants (see below). Returns
+  // nullptr (fall back to FP16) if TensorRT can't build/fuse it. Only reachable for 1x1 convs, where
+  // the weight contraction is a clean [outC, inC] and can also be block-quantized along inC.
+  ILayer* buildFP4Conv1x1(ITensor* input, const ConvLayerDesc* desc) {
+    auto& net = model->network;
+    const int inC = desc->inChannels, outC = desc->outChannels;
+    if(desc->convXSize != 1 || desc->convYSize != 1) return nullptr;  // 3x3 weight block layout is not clean; NHWC needed
+    if((inC % 16) != 0) return nullptr;
+
+    // Activation [N,C,H,W] -> [N,C,H*W] (3D): now C is the 2nd-to-last dim, so block-16 over it passes
+    // the layout check. (A 1x1 *kernel* conv still has full HxW spatial — only the kernel is 1x1.)
+    auto aShuf = net->addShuffle(*input);
+    aShuf->setReshapeDimensions(Dims{3, {0, 0, -1}});  // keep N,C; flatten H,W
+    aShuf->setName((desc->name + "/a3d").c_str());
+    // NVFP4 microscaling: block 16 elements along the channel axis (dim 1, 2nd-to-last). The V1
+    // addDynamicQuantize takes a scalar blockSize + axis, which is what the double-quant-scaled FP8
+    // scale path requires (the V2 Dims-blockShape form is rejected when a double_quant_scale is set).
+    auto aQ = net->addDynamicQuantize(*aShuf->getOutput(0), 1, 16, DataType::kFP4, DataType::kFP8);
+    if(!aQ) return nullptr;
+    // The per-block FP8 scales are themselves scaled by a positive 0D scalar (input 1).
+    auto dqScalarBuf = make_unique<float[]>(1); dqScalarBuf[0] = 1.0f;
+    auto dqScalar = net->addConstant(Dims{0, {}}, nvinfer1::Weights{DataType::kFLOAT, dqScalarBuf.get(), 1});
+    model->extraWeights.push_back(move(dqScalarBuf));
+    aQ->setInput(1, *dqScalar->getOutput(0));
+    aQ->setName((desc->name + "/aq4").c_str());
+    auto aDQ = net->addDequantize(*aQ->getOutput(0), *aQ->getOutput(1), DataType::kHALF);
+    aDQ->setAxis(1);
+    aDQ->setName((desc->name + "/adq4").c_str());
+    auto aBack = net->addShuffle(*aDQ->getOutput(0));
+    aBack->setReshapeDimensions(Dims4(0, 0, model->nnYLen, model->nnXLen));
+    aBack->setName((desc->name + "/a4d").c_str());
+
+    // Weights [outC, inC], block-16 over inC. FULLY PRE-QUANTIZED (baked) NVFP4: we compute the FP4
+    // (E2M1) weight values and their FP8 (E4M3) per-block scales offline and feed both as constants
+    // straight into IDequantize -> conv. No IQuantize (an FP8 scale tensor can't be an IQuantize input)
+    // and no dynamic quantize on weights (that stays a runtime op and segfaults inside libnvinfer). The
+    // constant FP4 weights + IDequantize is the pattern TensorRT recognizes to run the conv on the
+    // Blackwell FP4 tensor cores. Each element is quantized against its block's *decoded* FP8 scale so
+    // the dequant reconstructs it exactly (no scale double-rounding).
+    const int nBlk = inC / 16;
+    auto wfp4 = make_unique<uint8_t[]>(((size_t)outC * inC + 1) / 2);  // 2 FP4 nibbles per byte
+    auto wscale8 = make_unique<uint8_t[]>((size_t)outC * nBlk);
+    for(int o = 0; o < outC; o++)
+      for(int b = 0; b < nBlk; b++) {
+        float m = 1e-12f;
+        for(int i = 0; i < 16; i++) { float v = fabsf(desc->weights[(size_t)o * inC + b * 16 + i]); if(v > m) m = v; }
+        __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(m / 6.0f, __NV_SATFINITE, __NV_E4M3);
+        wscale8[(size_t)o * nBlk + b] = static_cast<uint8_t>(s8);
+        __half_raw hr = __nv_cvt_fp8_to_halfraw(s8, __NV_E4M3);
+        float dScale = __half2float(*reinterpret_cast<__half*>(&hr));
+        if(dScale <= 0.0f) dScale = 1e-12f;
+        for(int i = 0; i < 16; i++) {
+          size_t j = (size_t)o * inC + b * 16 + i;
+          __nv_fp4_storage_t q = __nv_cvt_float_to_fp4(desc->weights[j] / dScale, __NV_E2M1, cudaRoundNearest);
+          uint8_t nib = static_cast<uint8_t>(q) & 0x0F;
+          if(j & 1) wfp4[j >> 1] |= (nib << 4); else wfp4[j >> 1] = nib;  // low nibble = even index (verified)
+        }
+      }
+    auto wConst = net->addConstant(Dims{2, {outC, inC}}, nvinfer1::Weights{DataType::kFP4, wfp4.get(), (int64_t)outC * inC});
+    auto wScaleConst = net->addConstant(Dims{2, {outC, nBlk}}, nvinfer1::Weights{DataType::kFP8, wscale8.get(), (int64_t)outC * nBlk});
+    model->extraFp8Weights.push_back(move(wfp4));
+    model->extraFp8Weights.push_back(move(wscale8));
+    Dims wBlk; wBlk.nbDims = 2; wBlk.d[0] = 1; wBlk.d[1] = 16;
+    auto wDQ = net->addDequantize(*wConst->getOutput(0), *wScaleConst->getOutput(0), DataType::kHALF);
+    wDQ->setBlockShape(wBlk); wDQ->setName((desc->name + "/wdq4").c_str());
+    auto wBack = net->addShuffle(*wDQ->getOutput(0));
+    wBack->setReshapeDimensions(Dims4(outC, inC, 1, 1));  // -> conv kernel [outC, inC, 1, 1]
+
+    auto conv = net->addConvolutionNd(
+      *aBack->getOutput(0), outC, {2, {1, 1}},
+      nvinfer1::Weights{DataType::kHALF, nullptr, 0}, nvinfer1::Weights{DataType::kHALF, nullptr, 0});
+    conv->setInput(1, *wBack->getOutput(0));
+    conv->setPaddingMode(PaddingMode::kSAME_UPPER);
+    conv->setName(desc->name.c_str());
+    return conv;
+  }
+
+  ILayer* buildQuantizedConvLayer(ITensor* input, const ConvLayerDesc* desc, const BatchNormLayerDesc* actBN = nullptr) {
+    auto& net = model->network;
+    const int inC = desc->inChannels, outC = desc->outChannels;
+    const int kh = desc->convYSize, kw = desc->convXSize;
+    if(quantBits == 4) {
+      ILayer* fp4 = buildFP4Conv1x1(input, desc);
+      return fp4;  // may be nullptr for 3x3 -> buildConvLayer falls back to FP16
+    }
+    const int64_t nW = static_cast<int64_t>(desc->weights.size());
+    const int perOut = inC * kh * kw;
+    const double qMax = (quantBits == 4) ? 6.0 : 448.0;  // NVFP4 E2M1 max ~6, FP8 E4M3 max 448
+
+    // Per-output-channel weight scale from the weights themselves (calibration-free).
+    auto wscale = make_unique<float[]>(outC);
+    for(int o = 0; o < outC; o++) {
+      float m = 1e-12f;
+      for(int i = 0; i < perOut; i++) { float v = fabsf(desc->weights[(size_t)o * perOut + i]); if(v > m) m = v; }
+      wscale[o] = m / static_cast<float>(qMax);
+    }
+    auto whalf = make_unique<__half[]>(nW);
+    for(int64_t i = 0; i < nW; i++) whalf[i] = __float2half(desc->weights[i]);
+    auto wConst = net->addConstant(Dims4(outC, inC, kh, kw), nvinfer1::Weights{DataType::kHALF, whalf.get(), nW});
+    // Per-output-channel (axis 0) quantization wants a 1D scale of length outC; a 4D scale would be
+    // read as block quantization (which requires channel-last layout this NCHW trunk doesn't have).
+    Dims wScaleDims; wScaleDims.nbDims = 1; wScaleDims.d[0] = outC;
+    auto wScaleConst = net->addConstant(wScaleDims, nvinfer1::Weights{DataType::kFLOAT, wscale.get(), outC});
+    model->extraHalfWeights.push_back(move(whalf));
+    model->extraWeights.push_back(move(wscale));
+
+    auto wQ = net->addQuantize(*wConst->getOutput(0), *wScaleConst->getOutput(0), quantType());
+    wQ->setAxis(0);
+    wQ->setName((desc->name + "/wq").c_str());
+    auto wDQ = net->addDequantize(*wQ->getOutput(0), *wScaleConst->getOutput(0), DataType::kHALF);
+    wDQ->setAxis(0);
+    wDQ->setName((desc->name + "/wdq").c_str());
+
+    // Activation quantization. Two constraints shape this:
+    //  (1) Block microscaling (dynamic) needs the block dim last/2nd-to-last, i.e. channel-last (NHWC),
+    //      which this NCHW ModelParser trunk is not — so no block path here.
+    //  (2) A *per-channel* static scale (setAxis(1)) is layout-agnostic but blocks TensorRT-RTX from
+    //      fusing the fast FP8 conv, roughly halving the speedup — measured.
+    // So use a single per-tensor scalar (fast path) and just pick it well. Every quantized conv sits
+    // right after a folded BatchNorm (pre-act resnet: BN -> activation -> mask -> conv), so we size the
+    // scalar to the largest channel's post-mish range, derived analytically from that BN's running
+    // stats (no calibration data / extra forward pass):
+    //   post-BN pre-activation  v_c ~ N(mergedScale_c*mean_c + mergedBias_c, (mergedScale_c)^2*var_c)
+    // Bias conservative (~6 sigma + floor): clipping spikes policy/score error far worse than coarseness.
+    double actScalar;
+    if(actBN != nullptr && actBN->numChannels == inC) {
+      double mx = 0.35;
+      for(int c = 0; c < inC; c++) {
+        double ms = actBN->mergedScale[c], mb = actBN->mergedBias[c];
+        double meanV = ms * actBN->mean[c] + mb;
+        double stdV = fabs(ms) * sqrt((double)actBN->variance[c] + actBN->epsilon);
+        double actMax = fabs(meanV) + 6.0 * stdV + 0.5;  // conservative: clipping hurts more than coarseness
+        if(actMax > mx) mx = actMax;
+      }
+      actScalar = mx / qMax;
+    } else {
+      actScalar = 8.0 / qMax;  // untuned fallback when the preceding BN isn't known
+    }
+    auto ascaleBuf = make_unique<float[]>(1);
+    ascaleBuf[0] = static_cast<float>(actScalar);
+    auto aScaleConst = net->addConstant(Dims{0, {}}, nvinfer1::Weights{DataType::kFLOAT, ascaleBuf.get(), 1});
+    model->extraWeights.push_back(move(ascaleBuf));
+    auto aQ = net->addQuantize(*input, *aScaleConst->getOutput(0), quantType());
+    aQ->setName((desc->name + "/aq").c_str());
+    auto aDQ = net->addDequantize(*aQ->getOutput(0), *aScaleConst->getOutput(0), DataType::kHALF);
+    aDQ->setName((desc->name + "/adq").c_str());
+
+    auto conv = net->addConvolutionNd(
+      *aDQ->getOutput(0), outC, {2, {kh, kw}},
+      nvinfer1::Weights{DataType::kHALF, nullptr, 0}, nvinfer1::Weights{DataType::kHALF, nullptr, 0});
+    conv->setInput(1, *wDQ->getOutput(0));  // kernel as a tensor (weights parameter left empty)
+    conv->setDilationNd({2, {desc->dilationY, desc->dilationX}});
+    conv->setPaddingMode(PaddingMode::kSAME_UPPER);
+    conv->setName(desc->name.c_str());
+    return conv;
   }
 
   ILayer* buildBatchNormLayer(ITensor* input, const BatchNormLayerDesc* desc, bool forceFP32 = false) {
@@ -843,13 +1165,13 @@ struct ModelParser {
     auto bnLayer = model->network->addScale(
       *input,
       ScaleMode::kCHANNEL,
-      {DataType::kFLOAT, desc->mergedBias.data(), static_cast<int64_t>(numChannels)},
-      {DataType::kFLOAT, desc->mergedScale.data(), static_cast<int64_t>(numChannels)},
-      {DataType::kFLOAT, nullptr, 0});
+      weightsFor(desc->mergedBias.data(), static_cast<int64_t>(numChannels), forceFP32),
+      weightsFor(desc->mergedScale.data(), static_cast<int64_t>(numChannels), forceFP32),
+      emptyWeightsFor(forceFP32));
     bnLayer->setName(desc->name.c_str());
 
     if(forceFP32) {
-      bnLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(bnLayer);
     }
 
     return bnLayer;
@@ -861,7 +1183,7 @@ struct ModelParser {
       auto activationLayer = model->network->addIdentity(*input);
       activationLayer->setName(desc->name.c_str());
       if(forceFP32) {
-        activationLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(activationLayer);
       }
       return activationLayer;
     }
@@ -869,7 +1191,7 @@ struct ModelParser {
       auto activationLayer = model->network->addActivation(*input, ActivationType::kRELU);
       activationLayer->setName(desc->name.c_str());
       if(forceFP32) {
-        activationLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(activationLayer);
       }
       return activationLayer;
     }
@@ -883,9 +1205,9 @@ struct ModelParser {
       auto mergeLayer = model->network->addElementWise(*input, *tanhLayer->getOutput(0), ElementWiseOperation::kPROD);
       mergeLayer->setName(desc->name.c_str());
       if(forceFP32) {
-        softplusLayer->setPrecision(DataType::kFLOAT);
-        tanhLayer->setPrecision(DataType::kFLOAT);
-        mergeLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(softplusLayer);
+        trtSetLayerFP32(tanhLayer);
+        trtSetLayerFP32(mergeLayer);
       }
       return mergeLayer;
     }
@@ -901,9 +1223,9 @@ struct ModelParser {
       auto mergeLayer = model->network->addElementWise(*input, *tanhLayer->getOutput(0), ElementWiseOperation::kPROD);
       mergeLayer->setName(desc->name.c_str());
       if(forceFP32) {
-        softplusLayer->setPrecision(DataType::kFLOAT);
-        tanhLayer->setPrecision(DataType::kFLOAT);
-        mergeLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(softplusLayer);
+        trtSetLayerFP32(tanhLayer);
+        trtSetLayerFP32(mergeLayer);
       }
       return mergeLayer;
     }
@@ -921,6 +1243,12 @@ struct ModelParser {
     auto& network = model->network;
     string name = inputLayer->getName();
 
+    // Everything in this pool runs in the input's type: FP16 for trunk gpool blocks (forceFP32=false),
+    // FP32 for the policy/value-head pools (forceFP32=true). The mask-derived layers (maskSum/Scale/
+    // Quad, inputMask) are built once in FP32 and shared, so cast each to gpType at the point of use so
+    // every strongly-typed operator sees matching operand types.
+    const DataType gpType = typeFor(forceFP32);
+
     ILayer* gpoolSumLayer = nullptr;
     ILayer* gpoolMeanLayer = nullptr;
     if(!model->requireExactNNLen) {
@@ -928,7 +1256,7 @@ struct ModelParser {
       auto gpoolSumLayerName = name + "/gpsum";
       gpoolSumLayer->setName(gpoolSumLayerName.c_str());
       gpoolMeanLayer =
-        network->addElementWise(*gpoolSumLayer->getOutput(0), *maskSumLayer->getOutput(0), ElementWiseOperation::kDIV);
+        network->addElementWise(*gpoolSumLayer->getOutput(0), *castTensorTo(maskSumLayer->getOutput(0), gpType), ElementWiseOperation::kDIV);
     } else {
       gpoolMeanLayer = network->addReduce(*inputLayer->getOutput(0), ReduceOperation::kAVG, 1U << 2 | 1U << 3, true);
     }
@@ -936,7 +1264,7 @@ struct ModelParser {
     gpoolMeanLayer->setName(gpoolMeanLayerName.c_str());
 
     auto gpoolMeanScaleLayer = network->addElementWise(
-      *gpoolMeanLayer->getOutput(0), *maskScaleLayer->getOutput(0), ElementWiseOperation::kPROD);
+      *gpoolMeanLayer->getOutput(0), *castTensorTo(maskScaleLayer->getOutput(0), gpType), ElementWiseOperation::kPROD);
     auto gpoolMeanScaleLayerName = name + "/gpmeanscale";
     gpoolMeanScaleLayer->setName(gpoolMeanScaleLayerName.c_str());
 
@@ -945,7 +1273,7 @@ struct ModelParser {
     ILayer* gpoolConcatInputLayer3 = nullptr;
     if(isValueHead) {
       auto gpoolMeanQuadLayer = network->addElementWise(
-        *gpoolMeanLayer->getOutput(0), *maskQuadLayer->getOutput(0), ElementWiseOperation::kPROD);
+        *gpoolMeanLayer->getOutput(0), *castTensorTo(maskQuadLayer->getOutput(0), gpType), ElementWiseOperation::kPROD);
       auto gpoolMeanQuadLayerName = name + "/gpmeanquad";
       gpoolMeanQuadLayer->setName(gpoolMeanQuadLayerName.c_str());
       gpoolConcatInputLayer3 = gpoolMeanQuadLayer;
@@ -955,11 +1283,11 @@ struct ModelParser {
       auto gpoolMaskShiftWeights = make_unique<float[]>(1);
       gpoolMaskShiftWeights[0] = -1.0f;
       gpoolMaskShiftLayer = network->addScale(
-        *inputMask,
+        *castTensorTo(inputMask, gpType),
         ScaleMode::kUNIFORM,
-        {DataType::kFLOAT, gpoolMaskShiftWeights.get(), 1},
-        {DataType::kFLOAT, nullptr, 0},
-        {DataType::kFLOAT, nullptr, 0});
+        weightsFor(gpoolMaskShiftWeights.get(), 1, forceFP32),
+        emptyWeightsFor(forceFP32),
+        emptyWeightsFor(forceFP32));
       auto gpoolMaskShiftLayerName = name + "/gpmaskshift";
       gpoolMaskShiftLayer->setName(gpoolMaskShiftLayerName.c_str());
       model->extraWeights.push_back(move(gpoolMaskShiftWeights));
@@ -989,18 +1317,18 @@ struct ModelParser {
 
     if(forceFP32) {
       if(gpoolSumLayer) {
-        gpoolSumLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(gpoolSumLayer);
       }
       if(gpoolMaskAddLayer) {
-        gpoolMaskAddLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(gpoolMaskAddLayer);
       }
       if(gpoolMaskShiftLayer) {
-        gpoolMaskShiftLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(gpoolMaskShiftLayer);
       }
-      gpoolMeanLayer->setPrecision(DataType::kFLOAT);
-      gpoolMeanScaleLayer->setPrecision(DataType::kFLOAT);
-      gpoolConcatInputLayer3->setPrecision(DataType::kFLOAT);
-      gpoolConcatLayer->setPrecision(DataType::kFLOAT);
+      trtSetLayerFP32(gpoolMeanLayer);
+      trtSetLayerFP32(gpoolMeanScaleLayer);
+      trtSetLayerFP32(gpoolConcatInputLayer3);
+      trtSetLayerFP32(gpoolConcatLayer);
     }
 
     return gpoolConcatLayer;
@@ -1008,12 +1336,14 @@ struct ModelParser {
 
   ILayer* applyMaskLayer(ILayer* inputLayer, bool forceFP32 = false) {
     if(!model->requireExactNNLen) {
+      // The FP16 trunk multiplies by the FP16 mask; FP32 reductions/heads use the FP32 inputMask.
+      ITensor* mask = (useHalfTrunk && !forceFP32) ? inputMaskHalf : inputMask;
       auto maskLayer =
-        model->network->addElementWise(*inputLayer->getOutput(0), *inputMask, ElementWiseOperation::kPROD);
+        model->network->addElementWise(*inputLayer->getOutput(0), *mask, ElementWiseOperation::kPROD);
       auto maskLayerName = string(inputLayer->getName()) + "/mask";
       maskLayer->setName(maskLayerName.c_str());
       if(forceFP32) {
-        maskLayer->setPrecision(DataType::kFLOAT);
+        trtSetLayerFP32(maskLayer);
       }
       return maskLayer;
     } else {
@@ -1183,6 +1513,57 @@ struct ComputeHandle {
     }
 
     usingFP16 = false;
+    // On TensorRT-RTX, FP16 is expressed by building a strongly-typed half-precision graph, not by a
+    // builder flag. We do that in the hand-built ModelParser (halfTrunk): FP16 trunk + FP32 heads.
+    // The ONNX emitter path does not yet emit a half-precision graph, so it stays FP32/TF32 there.
+    bool halfTrunk = false;
+    int quantBits = 0;
+#if KATAGO_TRT_RTX
+    // TensorRT-RTX has no FP16 switch: precision is automatic and there is no platformHasFastFp16()
+    // or BuilderFlag::kFP16. Enable TF32 for the FP32 regions, and drive real FP16 via the strongly-
+    // typed half trunk when the ModelParser (trtDisableOnnx) path is in use.
+    config->setFlag(BuilderFlag::kTF32);
+    if(ctx->useFP16Mode == enabled_t::True || ctx->useFP16Mode == enabled_t::Auto) {
+      if(!useOnnxEmit) {
+        halfTrunk = true;
+        usingFP16 = true;
+        // MXFP8 / NVFP4 trunk builds on top of the FP16 trunk (activations are FP16 before the
+        // per-conv dynamic quantize). ModelParser path only.
+        quantBits = ctx->trunkQuantBits;
+      } else if(ctx->useFP16Mode == enabled_t::True) {
+        throw StringError(
+          "TensorRT-RTX FP16 requires the ModelParser path; set trtDisableOnnx=true (convnets only)");
+      }
+    }
+    if(ctx->trunkQuantBits > 0 && (useOnnxEmit || !halfTrunk))
+      throw StringError("trtTrunkPrecision fp8/fp4 requires trtDisableOnnx=true and useFP16!=false");
+    // NVFP4 (FP4 E2M1) has no per-tensor/per-channel quantize path — it only exists as block-16
+    // microscaling, which TensorRT-RTX requires to be channel-last (NHWC). This hand-built ModelParser
+    // trunk is NCHW, so FP4 can't be built here yet (it would fail deep in the builder). Reject early
+    // with a clear message. FP8 works because it supports a layout-agnostic per-tensor scale.
+    // NVFP4 status (see buildFP4Conv1x1): NVFP4 now EXECUTES correctly on TensorRT-RTX. The recipe:
+    //  - beat the layout wall with a 3D reshape [N,C,H,W]->[N,C,H*W] (C becomes 2nd-to-last), so
+    //    block-16 microscaling passes the "block dim last/2nd-to-last" check without an NHWC trunk;
+    //  - dynamic block-quantize the activation (runtime FP8 scales) — fine at inference;
+    //  - BAKE the weights as pre-quantized FP4 (E2M1) + FP8 (E4M3) block-scale constants into an
+    //    IDequantize. Dynamic-quantizing the weights instead stays a runtime op and segfaults inside
+    //    libnvinfer; baked constants fold at build time and run cleanly.
+    // BUT two hard limits remain on this net: (1) the clean reshape only reaches 1x1 convs, and on
+    // those FP4 is *slower* than FP16 (reshape+quant overhead dominates the small convs) — the 3x3
+    // FLOP bulk needs an NHWC trunk; (2) FP4 post-training quantization is too lossy here (scoreLead
+    // error ~0.47 from the 1x1 convs alone), so a useful FP4 net would need quantization-aware
+    // training. So FP4 is not a practical win yet; reject unless explicitly opted in.
+    if(quantBits == 4 && !ctx->fp4Experimental)
+      throw StringError(
+        "trtTrunkPrecision=fp4: NVFP4 now executes correctly (baked E2M1 weights + E4M3 block scales), "
+        "but on this net it only reaches 1x1 convs (slower than FP16) and FP4 PTQ is too lossy "
+        "(scoreLead ~0.47); a useful FP4 net needs an NHWC trunk for the 3x3 convs + quantization-aware "
+        "training. Use fp8 or fp16. (trtTrunkPrecisionExperimentalFp4=true runs the FP4 path anyway.)");
+#else
+    if(ctx->trunkQuantBits > 0)
+      throw StringError("trtTrunkPrecision fp8/fp4 is only supported on TensorRT-RTX");
+#endif
+#if !KATAGO_TRT_RTX
     if(builder->platformHasFastFp16()) {
       if(ctx->useFP16Mode == enabled_t::True || ctx->useFP16Mode == enabled_t::Auto) {
         config->setFlag(BuilderFlag::kFP16);
@@ -1191,6 +1572,7 @@ struct ComputeHandle {
     } else if(ctx->useFP16Mode == enabled_t::True) {
       throw StringError("CUDA device does not support useFP16=true");
     }
+#endif
     // The ONNX path may pin specific layers to FP32 below and needs the constraint to be hard
     // (kOBEY) so TensorRT cannot silently fall back to an FP16 path. The ModelParser path uses the
     // softer kPREFER. We set the flag after building the network, once forceObeyPrecision is known.
@@ -1208,7 +1590,13 @@ struct ComputeHandle {
     }
 
     auto network = unique_ptr<INetworkDefinition>(
+#if KATAGO_TRT_RTX
+      // TensorRT-RTX removed the implicit-batch path, so explicit batch is the only mode and the
+      // kEXPLICIT_BATCH creation flag no longer exists; a plain createNetworkV2(0) is explicit-batch.
+      builder->createNetworkV2(0));
+#else
       builder->createNetworkV2(1U << static_cast<int>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH)));
+#endif
     if(!network) {
       throw StringError("TensorRT backend: failed to create network definition");
     }
@@ -1257,7 +1645,7 @@ struct ComputeHandle {
       // this the parser may leave outputs in a reformatted layout and the copy reads garbage.
       for(int i = 0; i < network->getNbOutputs(); i++) {
         ITensor* out = network->getOutput(i);
-        out->setType(DataType::kFLOAT);
+        trtSetTensorFP32(out);
         out->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
       }
 
@@ -1275,9 +1663,9 @@ struct ComputeHandle {
         ILayer* layer = network->getLayer(i);
         const char* lname = layer->getName();
         if(lname != nullptr && fp32Names.count(string(lname))) {
-          layer->setPrecision(DataType::kFLOAT);
+          trtSetLayerFP32(layer);
           for(int o = 0; o < layer->getNbOutputs(); o++)
-            layer->setOutputType(o, DataType::kFLOAT);
+            trtSetLayerOutputFP32(layer, o);
           pinned++;
         }
       }
@@ -1316,14 +1704,20 @@ struct ComputeHandle {
     else {
       auto modelParser = make_unique<ModelParser>();
       model = modelParser->build(
-        move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen);
+        move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen, halfTrunk, quantBits);
     }
     debugOutputs = model->debugOutputs;
     config->addOptimizationProfile(profile);
 
     // Honor per-layer precision constraints. The ONNX path pins some layers to FP32 and needs a hard
     // constraint (kOBEY) so TensorRT cannot fall back to FP16; the ModelParser path uses kPREFER.
+#if KATAGO_TRT_RTX
+    // No precision-constraint flags on RTX: nothing was pinned (the setPrecision calls are no-ops)
+    // and the engine is already FP32/TF32, so there is nothing to constrain.
+    (void)forceObeyPrecision;
+#else
     config->setFlag(forceObeyPrecision ? BuilderFlag::kOBEY_PRECISION_CONSTRAINTS : BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
+#endif
 
 #if NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR == 5
     // This is to avoid external tactic sources and tactics that have shape switching overhead
@@ -1338,7 +1732,7 @@ struct ComputeHandle {
     if(prop->major >= 8) {
       // This is to avoid tactics that have shape switching overhead
       config->setTacticSources(1U << static_cast<uint32_t>(TacticSource::kJIT_CONVOLUTIONS));
-      config->setBuilderOptimizationLevel(2);
+      config->setBuilderOptimizationLevel(5);
     }
 #endif
 

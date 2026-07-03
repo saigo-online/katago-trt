@@ -91,3 +91,7 @@ cpp/build.ninja
 cpp/KataGoSwift.*
 cpp/include/KataGoSwift/KataGoSwift-swift.h
 cpp/external/katagocoreml/proto/
+
+# saigo katago-trt: build outputs and benchmark artifacts
+/build/
+bench/results/

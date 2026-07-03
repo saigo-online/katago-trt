@@ -273,8 +273,14 @@ int MainCmds::sandbox() {
   if(!builder)
     throw StringError("sandbox: failed to create TensorRT builder");
 
+#if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 11
+  // TensorRT-RTX removed the implicit-batch path; kEXPLICIT_BATCH no longer exists and
+  // createNetworkV2(0) is explicit-batch.
+  auto network = unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
+#else
   const auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
   auto network = unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicitBatch));
+#endif
   if(!network)
     throw StringError("sandbox: failed to create TensorRT network");
 
