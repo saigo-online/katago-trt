@@ -77,6 +77,23 @@ The port emits FP16 in the hand-built `ModelParser` (see `trtbackend.cpp`, `useH
 
 The FP16 path uses the ModelParser (`trtDisableOnnx = true`, convnets only) + `useFP16 = true`.
 
+## Headline: FP8 TensorRT-RTX vs stock KataGo CUDA
+
+The bottom line anyone actually cares about — this fork's best (FP8) vs what ships today
+(the stock CUDA backend, FP16). Same net, same board, both at their best default precision,
+builder opt-level 5, cache cleared per run:
+
+| threads / batch | FP8 TRT visits/s | stock CUDA visits/s | speedup | FP8 nnEvals/s | CUDA nnEvals/s |
+|---|---|---|---|---|---|
+| 16 / 8   | 1611 | 1189 | **+36%** | 1196 | 855 |
+| 32 / 16  | 1844 | 1077 | **+71%** | 1341 | 782 |
+| 64 / 32  | 1800 | 1263 | **+42%** | 1334 | 913 |
+| 128 / 70 | 1562 | 1105 | **+41%** | 1250 | 894 |
+
+**FP8 TensorRT-RTX runs KataGo ~1.4–1.7× faster than the stock CUDA backend on the GB10**, at
+near-FP16 accuracy (scoreLead within ~0.08 of FP32). `cudabackend.cpp` is unmodified upstream, so
+this is a fair TRT-vs-stock comparison.
+
 ## Going below FP16: FP8 and FP4 on the Blackwell tensor cores
 
 The GB10's peak throughput is at 4-bit (NVFP4); FP8 is the intermediate rung. Both are wired
